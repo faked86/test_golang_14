@@ -1,0 +1,6 @@
+./.mypy_cache/
+
+rust_lib/target/
+rust_lib/Cargo.toml
+
+*.so

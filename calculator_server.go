@@ -134,10 +134,13 @@ func worker(requests <-chan int64, done chan<- struct{}, metricsChan chan<- [2][
 			atomic.StoreInt64(&subValue, int64(C.sub(cSub, cNum)))
 			durationRust := time.Since(startRust).Seconds()
 			rustDurations = append(rustDurations, durationRust)
+
 		case <-ticker.C:
-			metricsChan <- [2][]float64{cDurations, rustDurations}
-			cDurations = cDurations[:0]
-			rustDurations = rustDurations[:0]
+			if len(cDurations) > 0 || len(rustDurations) > 0 {
+				metricsChan <- [2][]float64{cDurations, rustDurations}
+				cDurations = make([]float64, 0, 50000)
+				rustDurations = make([]float64, 0, 50000)
+			}
 		}
 	}
 }
@@ -147,20 +150,27 @@ func metricsAggregator(metricsChan <-chan [2][]float64) {
 		cDurations := metrics[0]
 		rustDurations := metrics[1]
 
-		if len(cDurations) == 0 || len(rustDurations) == 0 {
-			continue
+		if len(cDurations) > 0 {
+			sort.Float64s(cDurations)
+			cIdx95 := int(float64(len(cDurations)) * 0.95)
+			cIdx99 := int(float64(len(cDurations)) * 0.99)
+			atomic.StoreUint64(&p95C, math.Float64bits(cDurations[cIdx95]))
+			atomic.StoreUint64(&p99C, math.Float64bits(cDurations[cIdx99]))
+		} else {
+			atomic.StoreUint64(&p95C, 0)
+			atomic.StoreUint64(&p99C, 0)
 		}
-		sort.Float64s(cDurations)
-		sort.Float64s(rustDurations)
-		cIdx95 := int(float64(len(cDurations)) * 0.95)
-		cIdx99 := int(float64(len(cDurations)) * 0.99)
-		rustIdx95 := int(float64(len(rustDurations)) * 0.95)
-		rustIdx99 := int(float64(len(rustDurations)) * 0.99)
 
-		atomic.StoreUint64(&p95C, math.Float64bits(cDurations[cIdx95]))
-		atomic.StoreUint64(&p99C, math.Float64bits(cDurations[cIdx99]))
-		atomic.StoreUint64(&p95Rust, math.Float64bits(rustDurations[rustIdx95]))
-		atomic.StoreUint64(&p99Rust, math.Float64bits(rustDurations[rustIdx99]))
+		if len(rustDurations) > 0 {
+			sort.Float64s(rustDurations)
+			rustIdx95 := int(float64(len(rustDurations)) * 0.95)
+			rustIdx99 := int(float64(len(rustDurations)) * 0.99)
+			atomic.StoreUint64(&p95Rust, math.Float64bits(rustDurations[rustIdx95]))
+			atomic.StoreUint64(&p99Rust, math.Float64bits(rustDurations[rustIdx99]))
+		} else {
+			atomic.StoreUint64(&p95Rust, 0)
+			atomic.StoreUint64(&p99Rust, 0)
+		}
 	}
 }
 

@@ -4,3 +4,5 @@ rust_lib/target/
 rust_lib/Cargo.lock
 
 *.so
+
+задание.txt

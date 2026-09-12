@@ -66,7 +66,7 @@ func main() {
 	}()
 
 	<-stop
-	fmt.Printf("\nSIGINT received, shutting down...")
+	fmt.Printf("\nSIGINT received, shutting down...\n")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -85,52 +85,56 @@ func main() {
 func worker(requests <-chan int64, done chan<- struct{}) {
 	defer close(done)
 	for num := range requests {
-		cSum := C.int64_t(atomic.LoadInt64(&sumValue))
-		cSub := C.int64_t(atomic.LoadInt64(&subValue))
+		cSum := C.int64_t(sumValue)
+		cSub := C.int64_t(subValue)
 		cNum := C.int64_t(num)
 
 		// startC := time.Now()
-		sumValue = int64(C.add(cSum, cNum))
+		atomic.StoreInt64(&sumValue, int64(C.add(cSum, cNum)))
 		// durationC := time.Since(startC)
 
 		// startRust := time.Now()
-		subValue = int64(C.sub(cSub, cNum))
+		atomic.StoreInt64(&subValue, int64(C.sub(cSub, cNum)))
 		// durationRust := time.Since(startRust)
 	}
 }
 
 func makeCalcHandler(workerChan chan<- int64) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Pattern != "/calc" {
+		if r.URL.Path != "/calc" {
 			http.NotFound(w, r)
 			return
 		}
 
 		if r.Method != "POST" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
-			w.Write([]byte("Method NOT allowed"))
+			w.Write([]byte("method NOT allowed"))
 			return
 		}
 
 		q := r.URL.Query()
 		numRaw := q.Get("num")
 		if numRaw == "" {
-			w.WriteHeader(400)
+			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte("missing 'num' query parameter"))
 			return
 		}
 
 		num, err := strconv.Atoi(numRaw)
 		if err != nil {
-			w.WriteHeader(400)
+			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte("'num' must be an integer"))
 			return
 		}
 
-		workerChan <- int64(num)
-
-		w.WriteHeader(200)
-		w.Write([]byte("ok"))
+		select {
+		case workerChan <- int64(num):
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		default:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("queue full"))
+		}
 	}
 }
 

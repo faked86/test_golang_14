@@ -14,9 +14,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"syscall"
@@ -26,6 +28,11 @@ import (
 var (
 	sumValue int64
 	subValue int64
+	// quantile store as uint64, don't forget to convert back
+	p95C    uint64
+	p99C    uint64
+	p95Rust uint64
+	p99Rust uint64
 )
 
 type Slot struct {
@@ -52,9 +59,11 @@ func main() {
 	printerStop := make(chan struct{})
 	workerChan := make(chan int64, 10000)
 	workerDone := make(chan struct{})
+	metricsChan := make(chan [2][]float64)
 
 	go periodicPrinter(printerStop, *interval)
-	go worker(workerChan, workerDone)
+	go worker(workerChan, workerDone, metricsChan)
+	go metricsAggregator(metricsChan)
 
 	rpsBuf := &RpsBuffer{}
 
@@ -94,20 +103,64 @@ func main() {
 	printTotals("final")
 }
 
-func worker(requests <-chan int64, done chan<- struct{}) {
+func worker(requests <-chan int64, done chan<- struct{}, metricsChan chan<- [2][]float64) {
 	defer close(done)
-	for num := range requests {
-		cSum := C.int64_t(sumValue)
-		cSub := C.int64_t(subValue)
-		cNum := C.int64_t(num)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
-		// startC := time.Now()
-		atomic.StoreInt64(&sumValue, int64(C.add(cSum, cNum)))
-		// durationC := time.Since(startC)
+	cDurations := make([]float64, 0, 50000)
+	rustDurations := make([]float64, 0, 50000)
 
-		// startRust := time.Now()
-		atomic.StoreInt64(&subValue, int64(C.sub(cSub, cNum)))
-		// durationRust := time.Since(startRust)
+	for {
+		select {
+		case num, ok := <-requests:
+			if !ok {
+				if len(cDurations) > 0 || len(rustDurations) > 0 {
+					metricsChan <- [2][]float64{cDurations, rustDurations}
+				}
+				return
+			}
+
+			cSum := C.int64_t(sumValue)
+			cSub := C.int64_t(subValue)
+			cNum := C.int64_t(num)
+
+			startC := time.Now()
+			atomic.StoreInt64(&sumValue, int64(C.add(cSum, cNum)))
+			durationC := time.Since(startC).Seconds()
+			cDurations = append(cDurations, durationC)
+
+			startRust := time.Now()
+			atomic.StoreInt64(&subValue, int64(C.sub(cSub, cNum)))
+			durationRust := time.Since(startRust).Seconds()
+			rustDurations = append(rustDurations, durationRust)
+		case <-ticker.C:
+			metricsChan <- [2][]float64{cDurations, rustDurations}
+			cDurations = cDurations[:0]
+			rustDurations = rustDurations[:0]
+		}
+	}
+}
+
+func metricsAggregator(metricsChan <-chan [2][]float64) {
+	for metrics := range metricsChan {
+		cDurations := metrics[0]
+		rustDurations := metrics[1]
+
+		if len(cDurations) == 0 || len(rustDurations) == 0 {
+			continue
+		}
+		sort.Float64s(cDurations)
+		sort.Float64s(rustDurations)
+		cIdx95 := int(float64(len(cDurations)) * 0.95)
+		cIdx99 := int(float64(len(cDurations)) * 0.99)
+		rustIdx95 := int(float64(len(rustDurations)) * 0.95)
+		rustIdx99 := int(float64(len(rustDurations)) * 0.99)
+
+		atomic.StoreUint64(&p95C, math.Float64bits(cDurations[cIdx95]))
+		atomic.StoreUint64(&p99C, math.Float64bits(cDurations[cIdx99]))
+		atomic.StoreUint64(&p95Rust, math.Float64bits(rustDurations[rustIdx95]))
+		atomic.StoreUint64(&p99Rust, math.Float64bits(rustDurations[rustIdx99]))
 	}
 }
 
@@ -193,6 +246,18 @@ func makeMetricsHandler(rpsBuf *RpsBuffer) http.HandlerFunc {
 			}
 			responseBody = fmt.Appendf(responseBody, "http_requests_per_second{offset_seconds=\"%d\"} %d\n", i, rps)
 		}
+
+		responseBody = fmt.Append(responseBody, "# HELP c_function_duration_seconds Execution time of the C function in seconds\n")
+		responseBody = fmt.Append(responseBody, "# TYPE c_function_duration_seconds summary\n")
+
+		responseBody = fmt.Appendf(responseBody, "c_function_duration_seconds{quantile=\"0.95\"} %f\n", math.Float64frombits(atomic.LoadUint64(&p95C)))
+		responseBody = fmt.Appendf(responseBody, "c_function_duration_seconds{quantile=\"0.99\"} %f\n", math.Float64frombits(atomic.LoadUint64(&p99C)))
+
+		responseBody = fmt.Append(responseBody, "# HELP rust_function_duration_seconds Execution time of the Rust function in seconds\n")
+		responseBody = fmt.Append(responseBody, "# TYPE rust_function_duration_seconds summary\n")
+
+		responseBody = fmt.Appendf(responseBody, "rust_function_duration_seconds{quantile=\"0.95\"} %f\n", math.Float64frombits(atomic.LoadUint64(&p95Rust)))
+		responseBody = fmt.Appendf(responseBody, "rust_function_duration_seconds{quantile=\"0.99\"} %f\n", math.Float64frombits(atomic.LoadUint64(&p99Rust)))
 
 		w.Write(responseBody)
 	}

@@ -1,7 +1,7 @@
 package main
 
 /*
-#cgo LDFLAGS: -L. -lcalculator -lcalculator_rust
+#cgo LDFLAGS: -L../../ -lcalculator -lcalculator_rust
 #include <stdint.h>
 
 int64_t add(int64_t a, int64_t b);

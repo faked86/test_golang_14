@@ -28,6 +28,15 @@ var (
 	subValue int64
 )
 
+type Slot struct {
+	requests  int64
+	timestamp int64
+}
+
+type RpsBuffer struct {
+	slots [60]Slot
+}
+
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Calculator HTTP server\n\n")
@@ -47,8 +56,11 @@ func main() {
 	go periodicPrinter(printerStop, *interval)
 	go worker(workerChan, workerDone)
 
+	rpsBuf := &RpsBuffer{}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/calc", makeCalcHandler(workerChan))
+	mux.HandleFunc("/calc", makeCalcHandler(workerChan, rpsBuf))
+	mux.HandleFunc("/metrics", makeMetricsHandler(rpsBuf))
 
 	serverAddr := fmt.Sprintf("%s:%d", *host, *port)
 	server := &http.Server{
@@ -99,7 +111,7 @@ func worker(requests <-chan int64, done chan<- struct{}) {
 	}
 }
 
-func makeCalcHandler(workerChan chan<- int64) http.HandlerFunc {
+func makeCalcHandler(workerChan chan<- int64, rpsBuf *RpsBuffer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/calc" {
 			http.NotFound(w, r)
@@ -127,14 +139,62 @@ func makeCalcHandler(workerChan chan<- int64) http.HandlerFunc {
 			return
 		}
 
+		now := time.Now().Unix()
+		index := now % 60
+		for {
+			timestamp := atomic.LoadInt64(&rpsBuf.slots[index].timestamp)
+			if timestamp == now {
+				atomic.AddInt64(&rpsBuf.slots[index].requests, 1)
+				break
+			}
+			if atomic.CompareAndSwapInt64(&rpsBuf.slots[index].timestamp, timestamp, now) {
+				atomic.StoreInt64(&rpsBuf.slots[index].requests, 1)
+				break
+			}
+		}
+
 		select {
 		case workerChan <- int64(num):
-			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("ok"))
 		default:
 			w.WriteHeader(http.StatusServiceUnavailable)
 			w.Write([]byte("queue full"))
 		}
+	}
+}
+
+func makeMetricsHandler(rpsBuf *RpsBuffer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			w.Write([]byte("method NOT allowed"))
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+		responseBody := make([]byte, 0)
+		responseBody = fmt.Appendf(responseBody, "# HELP http_requests_per_second HTTP requests per second for the last 60 seconds\n")
+		responseBody = fmt.Appendf(responseBody, "# TYPE http_requests_per_second gauge\n")
+
+		now := time.Now().Unix()
+		for i := 59; i >= 0; i-- {
+			targetTime := now - int64(i)
+			index := targetTime % 60
+			rps := atomic.LoadInt64(&rpsBuf.slots[index].requests)
+			timestamp := atomic.LoadInt64(&rpsBuf.slots[index].timestamp)
+			if timestamp != targetTime {
+				rps = 0
+			}
+			responseBody = fmt.Appendf(responseBody, "http_requests_per_second{offset_seconds=\"%d\"} %d\n", i, rps)
+		}
+
+		w.Write(responseBody)
 	}
 }
 
